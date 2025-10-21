@@ -1,0 +1,98 @@
+name: Deploy Windows Server 2025 on Alibaba Cloud ECS
+
+on:
+  workflow_dispatch:
+
+env:
+  VM_NAME: rdp-windows-server-2022-vm
+  VM_REGION: us-east-1-wl1-nyc1
+  VM_ZONE: us-east-1-wl1-nyc1a
+  VM_IMAGE: win_2025_datacenter_x64_en
+  VM_INSTANCE_TYPE: ecs.g6.12xlarge
+  TERMINATE_AFTER: 180
+
+permissions:
+  contents: read
+
+jobs:
+  create-windows-vm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Alibaba Cloud CLI
+        run: |
+          curl -sS https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar -xz
+          sudo mv aliyun /usr/local/bin/aliyun
+          aliyun version || true
+
+      - name: Configure Alibaba Cloud CLI
+        run: |
+          aliyun configure set --mode AK \
+            --access-key-id ${{ secrets.ALIBABA_ACCESS_KEY_ID }} \
+            --access-key-secret ${{ secrets.ALIBABA_ACCESS_KEY_SECRET }} \
+            --region ${{ env.VM_REGION }}
+
+      - name: Create Windows ECS Instance (passwordless using KeyPair)
+        id: create_vm
+        env:
+          SECURITY_GROUP_ID: ${{ secrets.ALIBABA_SECURITY_GROUP_ID }}
+          KEY_PAIR_NAME: ${{ secrets.ALIBABA_KEY_PAIR_NAME }}
+        run: |
+          echo "Creating Windows Server 2025 instance..."
+          INSTANCE_JSON=$(aliyun ecs CreateInstance \
+            --RegionId "${{ env.VM_REGION }}" \
+            --ZoneId "${{ env.VM_ZONE }}" \
+            --InstanceName "${{ env.VM_NAME }}" \
+            --ImageId "${{ env.VM_IMAGE }}" \
+            --InstanceType "${{ env.VM_INSTANCE_TYPE }}" \
+            --SecurityGroupId "${SECURITY_GROUP_ID}" \
+            --KeyPairName "${KEY_PAIR_NAME}" \
+            --InternetMaxBandwidthOut 10 \
+            --IoOptimized true \
+            --InstanceChargeType PostPaid \
+            --Amount 1 \
+            --Output JSON)
+          
+          echo "$INSTANCE_JSON" > instance.json
+          INSTANCE_ID=$(echo "$INSTANCE_JSON" | jq -r '.InstanceId // .InstanceIds[0]')
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "ERROR: Could not extract InstanceId from CreateInstance output."
+            cat instance.json
+            exit 1
+          fi
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "Instance created: $INSTANCE_ID"
+
+      - name: Wait for instance to be Running and get Public IP
+        run: |
+          echo "Waiting for instance to be Running..."
+          STATUS=""
+          until [ "$STATUS" = "Running" ]; do
+            sleep 8
+            STATUS=$(aliyun ecs DescribeInstances --InstanceIds "[\"${{ env.INSTANCE_ID }}\"]" --Output JSON | jq -r '.Instances.Instance[0].Status' || echo "")
+            echo "Status: $STATUS"
+          done
+          PUBLIC_IP=$(aliyun ecs DescribeInstances --InstanceIds "[\"${{ env.INSTANCE_ID }}\"]" --Output JSON | jq -r '.Instances.Instance[0].PublicIpAddress.IpAddress[0]')
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "VM is running at IP: $PUBLIC_IP"
+
+      - name: Show RDP connection info
+        run: |
+          echo "────────────────────────────"
+          echo "Windows Server 2025 VM is ready!"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Public IP: $PUBLIC_IP"
+          echo "RDP: mstsc /v:$PUBLIC_IP"
+          echo "Login user: Administrator"
+          echo "Authentication: KeyPair '${{ secrets.ALIBABA_KEY_PAIR_NAME }}' (no password)"
+          echo "────────────────────────────"
+
+      - name: Schedule termination after timeout
+        run: |
+          echo "Sleeping for $TERMINATE_AFTER minutes before termination..."
+          sleep $((TERMINATE_AFTER * 60))
+          echo "Deleting instance $INSTANCE_ID ..."
+          aliyun ecs DeleteInstance --InstanceId "$INSTANCE_ID" --Force true
+          echo "Instance deleted ✅"
