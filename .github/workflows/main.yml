@@ -1,0 +1,80 @@
+name: Deploy macOS Sequoia EC2
+
+on:
+  workflow_dispatch:
+
+env:
+  TERMINATE_AFTER: 180   # زمان به دقیقه برای حذف خودکار (قابل تغییر)
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-macos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+          audience: sts.amazonaws.com
+
+      - name: Find latest macOS Sequoia AMI
+        id: find-ami
+        run: |
+          AMI_ID=$(aws ssm get-parameters-by-path \
+            --path /aws/service/macOS/ \
+            --region us-east-1 \
+            --query "Parameters[?contains(Name, 'sequoia')].Value" \
+            --output text | tail -n 1)
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+          echo "Using AMI: $AMI_ID"
+
+      - name: Launch macOS Sequoia EC2 Instance
+        id: launch
+        run: |
+          INSTANCE_JSON=$(aws ec2 run-instances \
+            --region us-east-1 \
+            --instance-type mac2.metal \
+            --image-id $AMI_ID \
+            --key-name "${{ secrets.AWS_KEY_NAME }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --security-group-ids "${{ secrets.AWS_SECURITY_GROUP_ID }}" \
+            --block-device-mappings DeviceName=/dev/sda1,Ebs={VolumeSize=200} \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=MacSequoiaNY}]" \
+            --output json)
+          INSTANCE_ID=$(echo $INSTANCE_JSON | jq -r '.Instances[0].InstanceId')
+          echo "INSTANCE_ID=$INSTANCE_ID" >> $GITHUB_ENV
+          echo "Instance launched: $INSTANCE_ID"
+
+      - name: Wait for instance to be running
+        run: |
+          echo "Waiting for instance to be in 'running' state..."
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region us-east-1
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "PUBLIC_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "✅ Instance ready at: $PUBLIC_IP"
+
+      - name: Show connection info
+        run: |
+          echo "────────────────────────────"
+          echo "macOS Sequoia 15.x launched!"
+          echo "Public IP: $PUBLIC_IP"
+          echo "SSH: ssh -i <your-key>.pem ec2-user@$PUBLIC_IP"
+          echo "────────────────────────────"
+
+      - name: Schedule termination after timeout
+        run: |
+          echo "Sleeping for $TERMINATE_AFTER minutes before termination..."
+          sleep $((TERMINATE_AFTER * 60))
+          echo "Terminating instance to prevent cost..."
+          aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region us-east-1
+          echo "Instance terminated ✅"
